@@ -1,0 +1,13 @@
+[package]
+name = "isolation-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = {version="4.5.54", features=["derive"]}
+gdal = "0.19.0"
+geo = {version="0.32.0", features=[]}
+proj = "0.31.0"
+rayon = "1.11.0"
+rstar = "0.12.2"
