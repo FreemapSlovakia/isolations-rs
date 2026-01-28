@@ -47,6 +47,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     num::NonZero,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -301,6 +302,10 @@ fn main() -> Result<()> {
     // --- Parallel execution using rayon ---
     // Each rayon worker keeps its own GDAL Dataset + BlockCache via thread-local storage.
 
+    let total_tasks = tasks.len();
+    let progress_every = 1000usize;
+    let done = Arc::new(AtomicUsize::new(0));
+
     let out = Arc::new(Mutex::new(BufWriter::new(
         File::create(args.output).context("Error creating output file")?,
     )));
@@ -340,6 +345,11 @@ fn main() -> Result<()> {
                         Err(e) => {
                             eprintln!("{};ERROR:{}", t.p.id, e);
                         }
+                    }
+
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % progress_every == 0 || n == total_tasks {
+                        eprintln!("Progress: {n}/{total_tasks} tasks");
                     }
                 }
             });
