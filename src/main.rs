@@ -72,9 +72,9 @@ struct Args {
     #[arg(long, default_value_t = 100_000.0)]
     max_radius: f64,
 
-    /// Minimum distance in meters for accepting DEM blockers (see header comment)
+    /// Cap snap radius (meters). 0 = no cap. Actual radius is 0.5 * nearest-neighbor distance.
     #[arg(long, default_value_t = 0.0)]
-    min_distance: f64,
+    snap_radius: f64,
 
     /// Maximum number of DEM blocks kept in memory (per thread)
     #[arg(long, default_value_t = 256)]
@@ -95,12 +95,7 @@ struct Peak {
     id: u64,
     point: Point,
     elev: DataType,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PeakRaw {
-    id: u64,
-    point: Point,
+    snap_radius_m: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,12 +184,41 @@ fn main() -> Result<()> {
         }
     };
 
-    let peaks_raw = read_peaks(&args.input).context("Error reading peaks")?;
+    let mut peaks_raw = read_peaks(&args.input).context("Error reading peaks")?;
 
     println!("Peaks (raw): {}", peaks_raw.len());
 
     if peaks_raw.is_empty() {
         return Ok(());
+    }
+
+    // Compute per-peak snap radius: 0.5 * nearest-neighbor distance, optionally capped.
+    let mut snap_tree = RTree::new();
+
+    for peak in &peaks_raw {
+        snap_tree.insert(*peak);
+    }
+
+    for peak in &mut peaks_raw {
+        let mut nn = None;
+
+        for (other, distance2) in snap_tree.nearest_neighbor_iter_with_distance_2(&peak.point) {
+            if other.id == peak.id {
+                continue;
+            }
+
+            nn = Some(distance2.sqrt());
+
+            break;
+        }
+
+        let mut snap = nn.unwrap_or(0.0) * 0.5;
+
+        if args.snap_radius > 0.0 {
+            snap = snap.min(args.snap_radius);
+        }
+
+        peak.snap_radius_m = snap;
     }
 
     let peak_clusters = cluster_peaks(&peaks_raw, &meta, args.cluster_shift);
@@ -373,10 +397,10 @@ fn cluster_tasks(tasks: &[PeakTask], meta: &DemMeta, cluster_shift: u8) -> Vec<V
     clusters
 }
 
-fn cluster_peaks(peaks: &[PeakRaw], meta: &DemMeta, cluster_shift: u8) -> Vec<Vec<PeakRaw>> {
+fn cluster_peaks(peaks: &[Peak], meta: &DemMeta, cluster_shift: u8) -> Vec<Vec<Peak>> {
     let (bw, bh) = (meta.block_w as isize, meta.block_h as isize);
 
-    let mut map: HashMap<(isize, isize), Vec<PeakRaw>> = HashMap::new();
+    let mut map: HashMap<(isize, isize), Vec<Peak>> = HashMap::new();
 
     for p in peaks {
         let (px_f, py_f) = coord_to_pixel(meta.gt, p.point);
@@ -421,7 +445,7 @@ fn cluster_peaks(peaks: &[PeakRaw], meta: &DemMeta, cluster_shift: u8) -> Vec<Ve
 }
 
 fn fill_elevations(
-    peak_clusters: Vec<Vec<PeakRaw>>,
+    peak_clusters: Vec<Vec<Peak>>,
     dem: &Path,
     meta: &DemMeta,
     block_cache: usize,
@@ -454,14 +478,17 @@ fn fill_elevations(
                         let mut out = Vec::with_capacity(cluster.len());
 
                         for p in cluster {
-                            if let Some(elev) = elevation_from_dem_state(state, p.point)?
-                                && elev > 0
+                            if let Some((point, elev)) =
+                                snap_peak_in_window(state, p.point, p.snap_radius_m)?
                             {
-                                out.push(Peak {
-                                    id: p.id,
-                                    point: p.point,
-                                    elev,
-                                });
+                                if elev > 0 {
+                                    out.push(Peak {
+                                        id: p.id,
+                                        point,
+                                        elev,
+                                        snap_radius_m: p.snap_radius_m,
+                                    });
+                                }
                             }
                         }
 
@@ -481,7 +508,7 @@ fn fill_elevations(
     Ok(peaks)
 }
 
-fn read_peaks(file: &Path) -> Result<Vec<PeakRaw>> {
+fn read_peaks(file: &Path) -> Result<Vec<Peak>> {
     let file = File::open(file).context("Error opening input file")?;
 
     let proj =
@@ -519,7 +546,12 @@ fn read_peaks(file: &Path) -> Result<Vec<PeakRaw>> {
                 .convert(point)
                 .context("Error projecting coordinates")?;
 
-            Ok(PeakRaw { id, point })
+            Ok(Peak {
+                id,
+                point,
+                elev: 0,
+                snap_radius_m: 0.0,
+            })
         })
         .collect()
 }
@@ -531,12 +563,7 @@ fn coord_to_pixel(gt: [f64; 6], point: Point) -> (f64, f64) {
     (x, y)
 }
 
-fn elevation_from_dem_state(state: &mut WorkerState, point: Point) -> Result<Option<DataType>> {
-    let (px_f, py_f) = coord_to_pixel(state.gt, point);
-
-    let x = px_f.round() as isize;
-    let y = py_f.round() as isize;
-
+fn read_elev_at(state: &mut WorkerState, x: isize, y: isize) -> Result<Option<DataType>> {
     if x < 0 || y < 0 || x >= state.raster_size.0 || y >= state.raster_size.1 {
         return Ok(None);
     }
@@ -557,6 +584,60 @@ fn elevation_from_dem_state(state: &mut WorkerState, point: Point) -> Result<Opt
     Ok(Some(z))
 }
 
+fn snap_peak_in_window(
+    state: &mut WorkerState,
+    point: Point,
+    snap_radius_m: f64,
+) -> Result<Option<(Point, DataType)>> {
+    let (px_f, py_f) = coord_to_pixel(state.gt, point);
+    let x0 = px_f.round() as isize;
+    let y0 = py_f.round() as isize;
+
+    let center = match read_elev_at(state, x0, y0)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    if snap_radius_m <= 0.0 {
+        return Ok(Some((point, center)));
+    }
+
+    let mpp = state.gt[1].abs().max(state.gt[5].abs()).max(1e-9);
+    let k = (snap_radius_m / mpp).ceil() as isize;
+
+    if k <= 0 {
+        return Ok(Some((point, center)));
+    }
+
+    let mut max = center;
+    let mut max_pos = (x0, y0);
+    let mut max_on_edge = false;
+
+    for dy in -k..=k {
+        let y = y0 + dy;
+        for dx in -k..=k {
+            let x = x0 + dx;
+            let z = match read_elev_at(state, x, y)? {
+                Some(v) => v,
+                None => continue,
+            };
+
+            if z > max {
+                max = z;
+                max_pos = (x, y);
+                max_on_edge = dx.abs() == k || dy.abs() == k;
+            }
+        }
+    }
+
+    if max > center && !max_on_edge {
+        let snapped = pixel_center_to_lonlat(state.gt, max_pos.0 as f64, max_pos.1 as f64);
+        return Ok(Some((snapped, max)));
+    }
+
+    Ok(Some((point, center)))
+}
+
 fn pixel_center_to_lonlat(gt: [f64; 6], px: f64, py: f64) -> Point {
     let x = px + 0.5;
     let y = py + 0.5;
@@ -567,19 +648,9 @@ fn pixel_center_to_lonlat(gt: [f64; 6], px: f64, py: f64) -> Point {
     Point::new(lon, lat)
 }
 
-fn approx_meters_per_pixel(gt: [f64; 6], lat: f64) -> f64 {
-    let m_per_deg_lat = 111_320.0;
-    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos().abs();
-
-    let mx = gt[1].abs() * m_per_deg_lon;
-    let my = gt[5].abs() * m_per_deg_lat;
-
-    mx.max(my).max(1e-9)
-}
-
 fn isolation_by_dem(
     state: &mut WorkerState,
-    p: Peak,
+    peak: Peak,
     search_radius_m: f64,
     effective_min_m: f64,
 ) -> Result<f64> {
@@ -599,13 +670,13 @@ fn isolation_by_dem(
 
         let z = read_band_data_cached(&band, state.block_size, &mut state.cache, x, y)?;
 
-        if z < p.elev {
+        if z < peak.elev {
             return Ok(best);
         }
 
         let point = pixel_center_to_lonlat(gt, x as f64, y as f64);
 
-        let d = Euclidean.distance(p.point, point);
+        let d = Euclidean.distance(peak.point, point);
 
         if d < effective_min_m {
             return Ok(best);
@@ -614,7 +685,7 @@ fn isolation_by_dem(
         Ok(best.min(d))
     };
 
-    let (px_f, py_f) = coord_to_pixel(gt, p.point);
+    let (px_f, py_f) = coord_to_pixel(gt, peak.point);
 
     let x0 = px_f.round() as isize;
     let y0 = py_f.round() as isize;
@@ -623,7 +694,8 @@ fn isolation_by_dem(
         return Ok(search_radius_m);
     }
 
-    let mpp = approx_meters_per_pixel(gt, p.point.y());
+    let mpp = gt[1].abs().max(gt[5].abs());
+
     let k_max = (search_radius_m / mpp).ceil() as isize;
 
     let mut best = search_radius_m;
@@ -633,34 +705,11 @@ fn isolation_by_dem(
             break;
         }
 
-        for dx in -k..=k {
-            let x = x0 + dx;
-
-            let y_top = y0 - k;
-            let y_bot = y0 + k;
-
-            if y_top >= 0 {
-                best = try_candidate(x, y_top, best)?;
-            }
-
-            if k != 0 && y_bot < raster_size.1 {
-                best = try_candidate(x, y_bot, best)?;
-            }
-        }
-
-        for dy in (-k + 1)..=(k - 1) {
-            if k == 0 {
-                break;
-            }
-
-            let y = y0 + dy;
-
-            let x_left = x0 - k;
-            let x_right = x0 + k;
-
-            best = try_candidate(x_left, y, best)?;
-
-            best = try_candidate(x_right, y, best)?;
+        for d in -k..k {
+            best = try_candidate(x0 + d, y0 - k, best)?;
+            best = try_candidate(x0 + k, y0 + d, best)?;
+            best = try_candidate(x0 - d, y0 + k, best)?;
+            best = try_candidate(x0 - k, y0 - d, best)?;
         }
     }
 
