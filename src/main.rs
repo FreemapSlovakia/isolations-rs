@@ -23,7 +23,7 @@
 // Lines starting with # are ignored.
 //
 // Output (stdout): semicolon-separated
-//   id;elev;isolation_m;blocker_lon;blocker_lat (EPSG:4326)
+//   id;lon;lat;elev;isolation_m;blocker_lon;blocker_lat (EPSG:4326)
 //   (elev is DEM value multiplied by GeoTIFF scale, if present)
 //
 // Notes:
@@ -73,9 +73,17 @@ struct Args {
     #[arg(long, default_value_t = 100_000.0)]
     max_radius: f64,
 
-    /// Cap snap radius (meters). 0 = no cap. Actual radius is 0.5 * nearest-neighbor distance.
-    #[arg(long, default_value_t = 0.0)]
+    /// Snap radius (meters). 0 disables snapping. Window never exceeds nearest-neighbor distance.
+    #[arg(long, default_value_t = 30.0)]
     snap_radius: f64,
+
+    /// Snap window growth factor when max is on edge.
+    #[arg(long, default_value_t = 2.0)]
+    snap_grow: f64,
+
+    /// Number of snap attempts (initial + retries).
+    #[arg(long, default_value_t = 3)]
+    snap_tries: usize,
 
     /// Maximum number of DEM blocks kept in memory (per thread)
     #[arg(long, default_value_t = 256)]
@@ -96,14 +104,14 @@ struct Peak {
     id: u64,
     point: Point,
     elev: DataType,
-    snap_radius_m: f64,
+    nn_dist_m: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PeakTask {
     p: Peak,
-    effective_min_m: f64,
     search_radius_m: f64,
+    higher_peak: Option<Point>,
 }
 
 impl RTreeObject for Peak {
@@ -194,7 +202,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Compute per-peak snap radius: 0.5 * nearest-neighbor distance, optionally capped.
+    // Compute per-peak nearest-neighbor distance for snap cap.
     let mut snap_tree = RTree::new();
 
     for peak in &peaks_raw {
@@ -214,13 +222,7 @@ fn main() -> Result<()> {
             break;
         }
 
-        let mut snap = nn.unwrap_or(0.0) * 0.5;
-
-        if args.snap_radius > 0.0 {
-            snap = snap.min(args.snap_radius);
-        }
-
-        peak.snap_radius_m = snap;
+        peak.nn_dist_m = nn.unwrap_or(0.0);
     }
 
     let peak_clusters = cluster_peaks(&peaks_raw, &meta, args.cluster_shift);
@@ -234,8 +236,8 @@ fn main() -> Result<()> {
         })
         .max(1);
 
-    let peaks = fill_elevations(peak_clusters, &args.dem, &meta, args.block_cache, threads)
-        .context("Error filling elevations from DEM")?;
+    let peaks = fill_elevations(peak_clusters, &args.dem, &meta, threads, &args)
+    .context("Error filling elevations from DEM")?;
 
     println!("Peaks: {}", peaks.len());
 
@@ -258,27 +260,24 @@ fn main() -> Result<()> {
     let tasks = tree
         .iter()
         .map(|p| {
-            let mut effective_min_m = f64::NAN;
-
             for (peak, distance2) in tree.nearest_neighbor_iter_with_distance_2(&p.point) {
                 if peak.id == p.id {
                     continue;
                 }
 
-                if f64::is_nan(effective_min_m) {
-                    effective_min_m = distance2.sqrt();
-                }
-
                 if peak.elev > p.elev || distance2 > max_radius2 {
-                    let search_radius_m =
-                        distance2.sqrt().min(args.max_radius).max(effective_min_m);
+                    let search_radius_m = distance2.sqrt().min(args.max_radius);
 
                     cnt += 1;
 
                     return PeakTask {
                         p: *p,
-                        effective_min_m,
                         search_radius_m,
+                        higher_peak: if peak.elev > p.elev {
+                            Some(peak.point)
+                        } else {
+                            None
+                        },
                     };
                 }
             }
@@ -287,8 +286,8 @@ fn main() -> Result<()> {
 
             PeakTask {
                 p: *p,
-                effective_min_m,
                 search_radius_m: args.max_radius,
+                higher_peak: None,
             }
         })
         .collect::<Vec<_>>();
@@ -303,9 +302,9 @@ fn main() -> Result<()> {
     // --- Parallel execution using rayon ---
     // Each rayon worker keeps its own GDAL Dataset + BlockCache via thread-local storage.
 
-    let total_tasks = tasks.len();
-    let progress_every = 1000usize;
+    let total_tasks = tasks.len().max(1);
     let done = Arc::new(AtomicUsize::new(0));
+    let last_percent = Arc::new(AtomicUsize::new(0));
 
     let out = Arc::new(Mutex::new(BufWriter::new(
         File::create(args.output).context("Error creating output file")?,
@@ -327,12 +326,8 @@ fn main() -> Result<()> {
                                 block_size: (meta.block_w as isize, meta.block_h as isize),
                                 cache: BlockCache::<DataType>::new(args.block_cache),
                                 nodata: meta.nodata,
-                                proj_to_wgs84: Proj::new_known_crs(
-                                    "EPSG:3035",
-                                    "EPSG:4326",
-                                    None,
-                                )
-                                .expect("proj EPSG:3035->4326"),
+                                proj_to_wgs84: Proj::new_known_crs("EPSG:3035", "EPSG:4326", None)
+                                    .expect("proj EPSG:3035->4326"),
                             });
                         }
 
@@ -340,18 +335,28 @@ fn main() -> Result<()> {
 
                         let state = borrow.as_mut().unwrap();
 
-                        isolation_by_dem(state, t.p, t.search_radius_m, t.effective_min_m)
+                        isolation_by_dem(state, t.p, t.search_radius_m, t.higher_peak)
                     });
 
                     match iso {
                         Ok((iso, blocker)) => {
                             let mut w = out.lock().unwrap();
                             let elev_scaled = (t.p.elev as f64) * meta.scale;
+                            let peak_ll = WORKER.with(|cell| {
+                                cell.borrow()
+                                    .as_ref()
+                                    .unwrap()
+                                    .proj_to_wgs84
+                                    .convert(t.p.point)
+                            });
+                            let peak_ll = peak_ll.expect("Error projecting peak to EPSG:4326");
                             if let Some(b) = blocker {
                                 writeln!(
                                     w,
-                                    "{};{};{};{};{}",
+                                    "{};{};{};{};{};{};{}",
                                     t.p.id,
+                                    peak_ll.x(),
+                                    peak_ll.y(),
                                     elev_scaled,
                                     iso,
                                     b.x(),
@@ -359,7 +364,16 @@ fn main() -> Result<()> {
                                 )
                                 .unwrap();
                             } else {
-                                writeln!(w, "{};{};{};;", t.p.id, elev_scaled, iso).unwrap();
+                                writeln!(
+                                    w,
+                                    "{};{};{};{};{};;",
+                                    t.p.id,
+                                    peak_ll.x(),
+                                    peak_ll.y(),
+                                    elev_scaled,
+                                    iso
+                                )
+                                .unwrap();
                             }
                         }
                         Err(e) => {
@@ -368,8 +382,14 @@ fn main() -> Result<()> {
                     }
 
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % progress_every == 0 || n == total_tasks {
-                        eprintln!("Progress: {n}/{total_tasks} tasks");
+                    let pct = ((n * 100) / total_tasks).min(100);
+                    let prev = last_percent.load(Ordering::Relaxed);
+                    if pct != prev
+                        && last_percent
+                            .compare_exchange(prev, pct, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        eprintln!("Progress: {pct}%");
                     }
                 }
             });
@@ -478,8 +498,8 @@ fn fill_elevations(
     peak_clusters: Vec<Vec<Peak>>,
     dem: &Path,
     meta: &DemMeta,
-    block_cache: usize,
     threads: usize,
+    args: &Args,
 ) -> Result<Vec<Peak>> {
     let filled = ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -496,14 +516,10 @@ fn fill_elevations(
                                 raster_size: (meta.width as isize, meta.height as isize),
                                 gt: meta.gt,
                                 block_size: (meta.block_w as isize, meta.block_h as isize),
-                                cache: BlockCache::<DataType>::new(block_cache),
+                                cache: BlockCache::<DataType>::new(args.block_cache),
                                 nodata: meta.nodata,
-                                proj_to_wgs84: Proj::new_known_crs(
-                                    "EPSG:3035",
-                                    "EPSG:4326",
-                                    None,
-                                )
-                                .expect("proj EPSG:3035->4326"),
+                                proj_to_wgs84: Proj::new_known_crs("EPSG:3035", "EPSG:4326", None)
+                                    .expect("proj EPSG:3035->4326"),
                             });
                         }
 
@@ -514,17 +530,21 @@ fn fill_elevations(
                         let mut out = Vec::with_capacity(cluster.len());
 
                         for p in cluster {
-                            if let Some((point, elev)) =
-                                snap_peak_in_window(state, p.point, p.snap_radius_m)?
+                            if let Some((point, elev)) = snap_peak_in_window(
+                                state,
+                                p.point,
+                                p.nn_dist_m,
+                                args.snap_radius,
+                                args.snap_grow,
+                                args.snap_tries,
+                            )? && elev > 0
                             {
-                                if elev > 0 {
-                                    out.push(Peak {
-                                        id: p.id,
-                                        point,
-                                        elev,
-                                        snap_radius_m: p.snap_radius_m,
-                                    });
-                                }
+                                out.push(Peak {
+                                    id: p.id,
+                                    point,
+                                    elev,
+                                    nn_dist_m: p.nn_dist_m,
+                                });
                             }
                         }
 
@@ -586,7 +606,7 @@ fn read_peaks(file: &Path) -> Result<Vec<Peak>> {
                 id,
                 point,
                 elev: 0,
-                snap_radius_m: 0.0,
+                nn_dist_m: 0.0,
             })
         })
         .collect()
@@ -623,7 +643,10 @@ fn read_elev_at(state: &mut WorkerState, x: isize, y: isize) -> Result<Option<Da
 fn snap_peak_in_window(
     state: &mut WorkerState,
     point: Point,
-    snap_radius_m: f64,
+    nn_dist_m: f64,
+    snap_cap_m: f64,
+    snap_grow: f64,
+    snap_tries: usize,
 ) -> Result<Option<(Point, DataType)>> {
     let (px_f, py_f) = coord_to_pixel(state.gt, point);
     let x0 = px_f.round() as isize;
@@ -634,41 +657,58 @@ fn snap_peak_in_window(
         None => return Ok(None),
     };
 
-    if snap_radius_m <= 0.0 {
+    if snap_cap_m <= 0.0 || nn_dist_m <= 0.0 {
         return Ok(Some((point, center)));
     }
 
     let mpp = state.gt[1].abs().max(state.gt[5].abs()).max(1e-9);
-    let k = (snap_radius_m / mpp).ceil() as isize;
 
-    if k <= 0 {
-        return Ok(Some((point, center)));
-    }
+    let tries = snap_tries.max(1);
 
-    let mut max = center;
-    let mut max_pos = (x0, y0);
-    let mut max_on_edge = false;
+    let mut radius = snap_cap_m;
 
-    for dy in -k..=k {
-        let y = y0 + dy;
-        for dx in -k..=k {
-            let x = x0 + dx;
-            let z = match read_elev_at(state, x, y)? {
-                Some(v) => v,
-                None => continue,
-            };
+    for _ in 0..tries {
+        if radius > nn_dist_m {
+            return Ok(Some((point, center)));
+        }
 
-            if z > max {
-                max = z;
-                max_pos = (x, y);
-                max_on_edge = dx.abs() == k || dy.abs() == k;
+        let k = (radius / mpp).ceil() as isize;
+
+        if k <= 0 {
+            return Ok(Some((point, center)));
+        }
+
+        let mut max = center;
+        let mut max_pos = (x0, y0);
+        let mut max_on_edge = false;
+
+        for dy in -k..=k {
+            let y = y0 + dy;
+            for dx in -k..=k {
+                let x = x0 + dx;
+                let z = match read_elev_at(state, x, y)? {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                if z > max {
+                    max = z;
+                    max_pos = (x, y);
+                    max_on_edge = dx.abs() == k || dy.abs() == k;
+                }
             }
         }
-    }
 
-    if max > center && !max_on_edge {
-        let snapped = pixel_center_to_lonlat(state.gt, max_pos.0 as f64, max_pos.1 as f64);
-        return Ok(Some((snapped, max)));
+        if max > center && !max_on_edge {
+            let snapped = pixel_center_to_lonlat(state.gt, max_pos.0 as f64, max_pos.1 as f64);
+            return Ok(Some((snapped, max)));
+        }
+
+        if snap_grow <= 1.0 {
+            break;
+        }
+
+        radius *= snap_grow;
     }
 
     Ok(Some((point, center)))
@@ -688,7 +728,7 @@ fn isolation_by_dem(
     state: &mut WorkerState,
     peak: Peak,
     search_radius_m: f64,
-    effective_min_m: f64,
+    higher_peak: Option<Point>,
 ) -> Result<(f64, Option<Point>)> {
     let raster_size = state.raster_size;
 
@@ -698,36 +738,32 @@ fn isolation_by_dem(
 
     let mut try_candidate =
         |x: isize, y: isize, best: f64, best_point: &mut Option<Point>| -> Result<f64> {
-        if x < 0 || y < 0 || x >= raster_size.0 || y >= raster_size.1 {
-            return Ok(best);
-        }
+            if x < 0 || y < 0 || x >= raster_size.0 || y >= raster_size.1 {
+                return Ok(best);
+            }
 
-        let band = state
-            .ds
-            .rasterband(1)
-            .context("Error fetching raster band 1")?;
+            let band = state
+                .ds
+                .rasterband(1)
+                .context("Error fetching raster band 1")?;
 
-        let z = read_band_data_cached(&band, state.block_size, &mut state.cache, x, y)?;
+            let z = read_band_data_cached(&band, state.block_size, &mut state.cache, x, y)?;
 
-        if z < peak.elev {
-            return Ok(best);
-        }
+            if z <= peak.elev {
+                return Ok(best);
+            }
 
-        let point = pixel_center_to_lonlat(gt, x as f64, y as f64);
+            let point = pixel_center_to_lonlat(gt, x as f64, y as f64);
 
-        let d = Euclidean.distance(peak.point, point);
+            let d = Euclidean.distance(peak.point, point);
 
-        if d < effective_min_m {
-            return Ok(best);
-        }
+            if d < best {
+                *best_point = Some(point);
+                return Ok(d);
+            }
 
-        if d < best {
-            *best_point = Some(point);
-            return Ok(d);
-        }
-
-        Ok(best)
-    };
+            Ok(best)
+        };
 
     let (px_f, py_f) = coord_to_pixel(gt, peak.point);
 
@@ -757,7 +793,7 @@ fn isolation_by_dem(
         }
     }
 
-    let best_point = match best_point {
+    let best_point = match best_point.or(higher_peak) {
         Some(p) => Some(
             state
                 .proj_to_wgs84
