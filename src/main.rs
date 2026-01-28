@@ -18,18 +18,15 @@
 // - Output order is NOT preserved (lines are printed as soon as a peak is computed).
 //
 // Input format (stdin): semicolon-separated
-//   <id>;<lon>;<lat>;<elev>
+//   <id>;<lon>;<lat>[;<elev>]
+//   (input elevation is optional and ignored; DEM elevation is used)
 // Lines starting with # are ignored.
 //
 // Output (stdout): semicolon-separated
 //   id;lon;lat;elev;isolation_m
-//
-// Dependencies (Cargo.toml):
-//   clap = { version = "4", features = ["derive"] }
-//   gdal = "0.17"
+//   (elev is DEM value multiplied by GeoTIFF scale, if present)
 //
 // Notes:
-// - Distance uses spherical haversine (fast, good enough).
 // - Assumes north-up geotransform (no rotation). If your DEM is rotated, reproject it.
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -144,14 +141,6 @@ fn main() -> Result<()> {
     let proj =
         Proj::new_known_crs("EPSG:4326", "EPSG:3035", None).context("Error creating projection")?;
 
-    let peaks = read_peaks(&args.input, &proj).context("Error reading peaks")?;
-
-    println!("Peaks: {}", peaks.len());
-
-    if peaks.is_empty() {
-        return Ok(());
-    }
-
     // Open once in the main thread to read georeferencing + block layout for clustering.
     let ds = Dataset::open(&args.dem).context("Error opening dataset")?;
 
@@ -171,6 +160,25 @@ fn main() -> Result<()> {
     let (block_w, block_h) = band.block_size();
 
     println!("Block size: {block_w}x{block_h}");
+
+    let scale = band.scale().unwrap_or(1.0);
+
+    let peaks = read_peaks(
+        &args.input,
+        &proj,
+        &band,
+        gt,
+        (width as isize, height as isize),
+        (block_w as isize, block_h as isize),
+        args.block_cache,
+    )
+    .context("Error reading peaks")?;
+
+    println!("Peaks: {}", peaks.len());
+
+    if peaks.is_empty() {
+        return Ok(());
+    }
 
     let mut tree = RTree::new();
 
@@ -214,11 +222,11 @@ fn main() -> Result<()> {
 
             cnt += 1;
 
-            return PeakTask {
+            PeakTask {
                 p: *p,
                 effective_min_m,
                 search_radius_m: args.max_radius,
-            };
+            }
         })
         .collect::<Vec<_>>();
 
@@ -271,15 +279,16 @@ fn main() -> Result<()> {
 
                         let mut borrow = cell.borrow_mut();
 
-                        let mut state = borrow.as_mut().unwrap();
+                        let state = borrow.as_mut().unwrap();
 
-                        isolation_by_dem(&mut state, t.p, t.search_radius_m, t.effective_min_m)
+                        isolation_by_dem(state, t.p, t.search_radius_m, t.effective_min_m)
                     });
 
                     match iso {
                         Ok(iso) => {
                             let mut w = out.lock().unwrap();
-                            writeln!(w, "{};{};{}", t.p.id, t.p.elev, iso as u32).unwrap();
+                            let elev_scaled = (t.p.elev as f64) * scale;
+                            writeln!(w, "{};{};{}", t.p.id, elev_scaled, iso).unwrap();
                         }
                         Err(e) => {
                             eprintln!("{};ERROR:{}", t.p.id, e);
@@ -323,8 +332,8 @@ fn cluster_tasks(
     }
 
     let mut clusters = map
-        .into_iter()
-        .map(|(_, mut v)| {
+        .into_values()
+        .map(|mut v| {
             v.sort_by(|a, b| {
                 let (ax, ay) = coord_to_pixel(gt, a.p.point);
                 let (bx, by) = coord_to_pixel(gt, b.p.point);
@@ -341,15 +350,27 @@ fn cluster_tasks(
         })
         .collect::<Vec<_>>();
 
-    clusters.sort_by(|a, b| b.len().cmp(&a.len()));
+    clusters.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     clusters
 }
 
-fn read_peaks(file: &Path, proj: &Proj) -> Result<Vec<Peak>> {
+fn read_peaks(
+    file: &Path,
+    proj: &Proj,
+    band: &gdal::raster::RasterBand,
+    gt: [f64; 6],
+    raster_size: (isize, isize),
+    block_size: (isize, isize),
+    block_cache: usize,
+) -> Result<Vec<Peak>> {
     let file = File::open(file).context("Error opening input file")?;
 
-    BufReader::new(file)
+    let mut cache = BlockCache::<DataType>::new(block_cache);
+
+    let nodata = band.no_data_value();
+
+    let mut peaks = BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .map(|line| line.trim().to_string())
@@ -374,22 +395,24 @@ fn read_peaks(file: &Path, proj: &Proj) -> Result<Vec<Peak>> {
                     .context("lat must be f64")?,
             );
 
-            let elev = it.next().ok_or(anyhow!("Expected elevation"))?;
-
-            // let elev: DataType = if elev == "" {
-            //     0
-            // } else {
-            //     elev.parse().context("elevation must be f64")?
-            // };
+            // Optional input elevation (ignored; DEM elevation is used instead).
+            let _ = it.next();
 
             let point = proj
                 .convert(point)
                 .context("Error projecting coordinates")?;
 
+            let elev =
+                elevation_from_dem(band, gt, raster_size, block_size, &mut cache, nodata, point)?
+                    .unwrap_or(0);
+
             Ok(Peak { id, point, elev })
         })
-        .filter(|peak| matches!(peak, Ok(Peak { id, point, elev }) if *elev > 0))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    peaks.retain(|p| p.elev > 0);
+
+    Ok(peaks)
 }
 
 fn coord_to_pixel(gt: [f64; 6], point: Point) -> (f64, f64) {
@@ -397,6 +420,35 @@ fn coord_to_pixel(gt: [f64; 6], point: Point) -> (f64, f64) {
     let y = (point.y() - gt[3]) / gt[5];
 
     (x, y)
+}
+
+fn elevation_from_dem(
+    band: &gdal::raster::RasterBand,
+    gt: [f64; 6],
+    raster_size: (isize, isize),
+    block_size: (isize, isize),
+    cache: &mut BlockCache<DataType>,
+    nodata: Option<f64>,
+    point: Point,
+) -> Result<Option<DataType>> {
+    let (px_f, py_f) = coord_to_pixel(gt, point);
+
+    let x = px_f.round() as isize;
+    let y = py_f.round() as isize;
+
+    if x < 0 || y < 0 || x >= raster_size.0 || y >= raster_size.1 {
+        return Ok(None);
+    }
+
+    let z = read_band_data_cached(band, block_size, cache, x, y)?;
+
+    if let Some(nd) = nodata
+        && (z as f64) == nd
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(z))
 }
 
 fn pixel_center_to_lonlat(gt: [f64; 6], px: f64, py: f64) -> Point {
@@ -485,10 +537,8 @@ fn isolation_by_dem(
                 best = try_candidate(x, y_top, best)?;
             }
 
-            if k != 0 {
-                if y_bot < raster_size.1 {
-                    best = try_candidate(x, y_bot, best)?;
-                }
+            if k != 0 && y_bot < raster_size.1 {
+                best = try_candidate(x, y_bot, best)?;
             }
         }
 
