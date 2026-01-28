@@ -23,7 +23,7 @@
 // Lines starting with # are ignored.
 //
 // Output (stdout): semicolon-separated
-//   id;lon;lat;elev;isolation_m
+//   id;elev;isolation_m;blocker_lon;blocker_lat (EPSG:4326)
 //   (elev is DEM value multiplied by GeoTIFF scale, if present)
 //
 // Notes:
@@ -132,6 +132,7 @@ struct WorkerState {
     block_size: (isize, isize),
     cache: BlockCache<DataType>,
     nodata: Option<f64>,
+    proj_to_wgs84: Proj,
 }
 
 thread_local! {
@@ -326,6 +327,12 @@ fn main() -> Result<()> {
                                 block_size: (meta.block_w as isize, meta.block_h as isize),
                                 cache: BlockCache::<DataType>::new(args.block_cache),
                                 nodata: meta.nodata,
+                                proj_to_wgs84: Proj::new_known_crs(
+                                    "EPSG:3035",
+                                    "EPSG:4326",
+                                    None,
+                                )
+                                .expect("proj EPSG:3035->4326"),
                             });
                         }
 
@@ -337,10 +344,23 @@ fn main() -> Result<()> {
                     });
 
                     match iso {
-                        Ok(iso) => {
+                        Ok((iso, blocker)) => {
                             let mut w = out.lock().unwrap();
                             let elev_scaled = (t.p.elev as f64) * meta.scale;
-                            writeln!(w, "{};{};{}", t.p.id, elev_scaled, iso).unwrap();
+                            if let Some(b) = blocker {
+                                writeln!(
+                                    w,
+                                    "{};{};{};{};{}",
+                                    t.p.id,
+                                    elev_scaled,
+                                    iso,
+                                    b.x(),
+                                    b.y()
+                                )
+                                .unwrap();
+                            } else {
+                                writeln!(w, "{};{};{};;", t.p.id, elev_scaled, iso).unwrap();
+                            }
                         }
                         Err(e) => {
                             eprintln!("{};ERROR:{}", t.p.id, e);
@@ -478,6 +498,12 @@ fn fill_elevations(
                                 block_size: (meta.block_w as isize, meta.block_h as isize),
                                 cache: BlockCache::<DataType>::new(block_cache),
                                 nodata: meta.nodata,
+                                proj_to_wgs84: Proj::new_known_crs(
+                                    "EPSG:3035",
+                                    "EPSG:4326",
+                                    None,
+                                )
+                                .expect("proj EPSG:3035->4326"),
                             });
                         }
 
@@ -663,12 +689,15 @@ fn isolation_by_dem(
     peak: Peak,
     search_radius_m: f64,
     effective_min_m: f64,
-) -> Result<f64> {
+) -> Result<(f64, Option<Point>)> {
     let raster_size = state.raster_size;
 
     let gt = state.gt;
 
-    let mut try_candidate = |x: isize, y: isize, best: f64| -> Result<f64> {
+    let mut best_point: Option<Point> = None;
+
+    let mut try_candidate =
+        |x: isize, y: isize, best: f64, best_point: &mut Option<Point>| -> Result<f64> {
         if x < 0 || y < 0 || x >= raster_size.0 || y >= raster_size.1 {
             return Ok(best);
         }
@@ -692,7 +721,12 @@ fn isolation_by_dem(
             return Ok(best);
         }
 
-        Ok(best.min(d))
+        if d < best {
+            *best_point = Some(point);
+            return Ok(d);
+        }
+
+        Ok(best)
     };
 
     let (px_f, py_f) = coord_to_pixel(gt, peak.point);
@@ -701,7 +735,7 @@ fn isolation_by_dem(
     let y0 = py_f.round() as isize;
 
     if x0 < 0 || y0 < 0 || x0 >= raster_size.0 || y0 >= raster_size.1 {
-        return Ok(search_radius_m);
+        return Ok((search_radius_m, None));
     }
 
     let mpp = gt[1].abs().max(gt[5].abs());
@@ -716,14 +750,24 @@ fn isolation_by_dem(
         }
 
         for d in -k..k {
-            best = try_candidate(x0 + d, y0 - k, best)?;
-            best = try_candidate(x0 + k, y0 + d, best)?;
-            best = try_candidate(x0 - d, y0 + k, best)?;
-            best = try_candidate(x0 - k, y0 - d, best)?;
+            best = try_candidate(x0 + d, y0 - k, best, &mut best_point)?;
+            best = try_candidate(x0 + k, y0 + d, best, &mut best_point)?;
+            best = try_candidate(x0 - d, y0 + k, best, &mut best_point)?;
+            best = try_candidate(x0 - k, y0 - d, best, &mut best_point)?;
         }
     }
 
-    Ok(best)
+    let best_point = match best_point {
+        Some(p) => Some(
+            state
+                .proj_to_wgs84
+                .convert(p)
+                .context("Error projecting blocker to EPSG:4326")?,
+        ),
+        None => None,
+    };
+
+    Ok((best, best_point))
 }
 
 fn read_band_data_cached(
