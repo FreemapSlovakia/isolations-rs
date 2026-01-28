@@ -98,6 +98,12 @@ struct Peak {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PeakRaw {
+    id: u64,
+    point: Point,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PeakTask {
     p: Peak,
     effective_min_m: f64,
@@ -129,50 +135,81 @@ struct WorkerState {
     gt: [f64; 6],
     block_size: (isize, isize),
     cache: BlockCache<DataType>,
+    nodata: Option<f64>,
 }
 
 thread_local! {
     static WORKER: RefCell<Option<WorkerState>> = const { RefCell::new(None) };
 }
 
+struct DemMeta {
+    gt: [f64; 6],
+    width: usize,
+    height: usize,
+    block_w: usize,
+    block_h: usize,
+    nodata: Option<f64>,
+    scale: f64,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let proj =
-        Proj::new_known_crs("EPSG:4326", "EPSG:3035", None).context("Error creating projection")?;
+    let meta = {
+        let ds = Dataset::open(&args.dem).context("Error opening dataset")?;
 
-    // Open once in the main thread to read georeferencing + block layout for clustering.
-    let ds = Dataset::open(&args.dem).context("Error opening dataset")?;
+        let band = ds.rasterband(1).context("Error getting rasterband 1")?;
 
-    let band = ds.rasterband(1).context("Error getting rasterband 1")?;
+        let gt = ds.geo_transform().context("Error getting transformation")?;
 
-    let gt = ds.geo_transform().context("Error getting transformation")?;
+        // North-up only: gt[2] and gt[4] are 0.
+        if gt[2] != 0.0 || gt[4] != 0.0 {
+            bail!("Rotated geotransform not supported (reproject/warp to north-up).");
+        }
 
-    // North-up only: gt[2] and gt[4] are 0.
-    if gt[2] != 0.0 || gt[4] != 0.0 {
-        bail!("Rotated geotransform not supported (reproject/warp to north-up).");
+        let (width, height) = ds.raster_size();
+
+        println!("DEM dimensions: {width}x{height}");
+
+        let (block_w, block_h) = band.block_size();
+
+        println!("Block size: {block_w}x{block_h}");
+
+        let scale = band.scale().unwrap_or(1.0);
+        let nodata = band.no_data_value();
+
+        DemMeta {
+            gt,
+            width,
+            height,
+            block_w,
+            block_h,
+            nodata,
+            scale,
+        }
+    };
+
+    let peaks_raw = read_peaks(&args.input).context("Error reading peaks")?;
+
+    println!("Peaks (raw): {}", peaks_raw.len());
+
+    if peaks_raw.is_empty() {
+        return Ok(());
     }
 
-    let (width, height) = ds.raster_size();
+    let peak_clusters = cluster_peaks(&peaks_raw, &meta, args.cluster_shift);
 
-    println!("DEM dimensions: {width}x{height}");
+    let threads = args
+        .threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(NonZero::get)
+                .unwrap_or(1)
+        })
+        .max(1);
 
-    let (block_w, block_h) = band.block_size();
-
-    println!("Block size: {block_w}x{block_h}");
-
-    let scale = band.scale().unwrap_or(1.0);
-
-    let peaks = read_peaks(
-        &args.input,
-        &proj,
-        &band,
-        gt,
-        (width as isize, height as isize),
-        (block_w as isize, block_h as isize),
-        args.block_cache,
-    )
-    .context("Error reading peaks")?;
+    let peaks = fill_elevations(peak_clusters, &args.dem, &meta, args.block_cache, threads)
+        .context("Error filling elevations from DEM")?;
 
     println!("Peaks: {}", peaks.len());
 
@@ -233,27 +270,12 @@ fn main() -> Result<()> {
     println!("Tasks: {}", tasks.len());
 
     // Cluster tasks by super-block for cache locality.
-    let clusters = cluster_tasks(
-        &tasks,
-        gt,
-        (width as isize, height as isize),
-        (block_w as isize, block_h as isize),
-        args.cluster_shift,
-    );
+    let clusters = cluster_tasks(&tasks, &meta, args.cluster_shift);
 
     println!("Clusters: {}", clusters.len());
 
     // --- Parallel execution using rayon ---
     // Each rayon worker keeps its own GDAL Dataset + BlockCache via thread-local storage.
-
-    let threads = args
-        .threads
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(NonZero::get)
-                .unwrap_or(1)
-        })
-        .max(1);
 
     let out = Arc::new(Mutex::new(BufWriter::new(
         File::create(args.output).context("Error creating output file")?,
@@ -270,10 +292,11 @@ fn main() -> Result<()> {
                         if cell.borrow().is_none() {
                             *cell.borrow_mut() = Some(WorkerState {
                                 ds: Dataset::open(&args.dem).expect("open DEM"),
-                                raster_size: (width as isize, height as isize),
-                                gt,
-                                block_size: (block_w as isize, block_h as isize),
+                                raster_size: (meta.width as isize, meta.height as isize),
+                                gt: meta.gt,
+                                block_size: (meta.block_w as isize, meta.block_h as isize),
                                 cache: BlockCache::<DataType>::new(args.block_cache),
+                                nodata: meta.nodata,
                             });
                         }
 
@@ -287,7 +310,7 @@ fn main() -> Result<()> {
                     match iso {
                         Ok(iso) => {
                             let mut w = out.lock().unwrap();
-                            let elev_scaled = (t.p.elev as f64) * scale;
+                            let elev_scaled = (t.p.elev as f64) * meta.scale;
                             writeln!(w, "{};{};{}", t.p.id, elev_scaled, iso).unwrap();
                         }
                         Err(e) => {
@@ -303,28 +326,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn cluster_tasks(
-    tasks: &[PeakTask],
-    gt: [f64; 6],
-    raster_size: (isize, isize),
-    block_size: (isize, isize),
-    cluster_shift: u8,
-) -> Vec<Vec<PeakTask>> {
-    let (bw, bh) = block_size;
+fn cluster_tasks(tasks: &[PeakTask], meta: &DemMeta, cluster_shift: u8) -> Vec<Vec<PeakTask>> {
+    let (bw, bh) = (meta.block_w as isize, meta.block_h as isize);
 
     let mut map: HashMap<(isize, isize), Vec<PeakTask>> = HashMap::new();
 
     for t in tasks {
-        let (px_f, py_f) = coord_to_pixel(gt, t.p.point);
+        let (px_f, py_f) = coord_to_pixel(meta.gt, t.p.point);
         let x0 = px_f.round() as isize;
         let y0 = py_f.round() as isize;
 
         // Peaks outside DEM will still get a result (search_radius), but put them into a single cluster.
-        let (bx, by) = if x0 < 0 || y0 < 0 || x0 >= raster_size.0 || y0 >= raster_size.1 {
-            (0, 0)
-        } else {
-            (x0.div_euclid(bw), y0.div_euclid(bh))
-        };
+        let (bx, by) =
+            if x0 < 0 || y0 < 0 || x0 >= meta.width as isize || y0 >= meta.height as isize {
+                (0, 0)
+            } else {
+                (x0.div_euclid(bw), y0.div_euclid(bh))
+            };
 
         let key = (bx >> cluster_shift, by >> cluster_shift);
 
@@ -335,8 +353,8 @@ fn cluster_tasks(
         .into_values()
         .map(|mut v| {
             v.sort_by(|a, b| {
-                let (ax, ay) = coord_to_pixel(gt, a.p.point);
-                let (bx, by) = coord_to_pixel(gt, b.p.point);
+                let (ax, ay) = coord_to_pixel(meta.gt, a.p.point);
+                let (bx, by) = coord_to_pixel(meta.gt, b.p.point);
 
                 let ax = ax.round() as isize;
                 let ay = ay.round() as isize;
@@ -355,22 +373,121 @@ fn cluster_tasks(
     clusters
 }
 
-fn read_peaks(
-    file: &Path,
-    proj: &Proj,
-    band: &gdal::raster::RasterBand,
-    gt: [f64; 6],
-    raster_size: (isize, isize),
-    block_size: (isize, isize),
+fn cluster_peaks(peaks: &[PeakRaw], meta: &DemMeta, cluster_shift: u8) -> Vec<Vec<PeakRaw>> {
+    let (bw, bh) = (meta.block_w as isize, meta.block_h as isize);
+
+    let mut map: HashMap<(isize, isize), Vec<PeakRaw>> = HashMap::new();
+
+    for p in peaks {
+        let (px_f, py_f) = coord_to_pixel(meta.gt, p.point);
+        let x0 = px_f.round() as isize;
+        let y0 = py_f.round() as isize;
+
+        // Peaks outside DEM will still get a result later, but group them in a single cluster.
+        let (bx, by) =
+            if x0 < 0 || y0 < 0 || x0 >= meta.width as isize || y0 >= meta.height as isize {
+                (0, 0)
+            } else {
+                (x0.div_euclid(bw), y0.div_euclid(bh))
+            };
+
+        let key = (bx >> cluster_shift, by >> cluster_shift);
+
+        map.entry(key).or_default().push(*p);
+    }
+
+    let mut clusters = map
+        .into_values()
+        .map(|mut v| {
+            v.sort_by(|a, b| {
+                let (ax, ay) = coord_to_pixel(meta.gt, a.point);
+                let (bx, by) = coord_to_pixel(meta.gt, b.point);
+
+                let ax = ax.round() as isize;
+                let ay = ay.round() as isize;
+                let bx = bx.round() as isize;
+                let by = by.round() as isize;
+
+                (ay, ax).cmp(&(by, bx))
+            });
+
+            v
+        })
+        .collect::<Vec<_>>();
+
+    clusters.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+    clusters
+}
+
+fn fill_elevations(
+    peak_clusters: Vec<Vec<PeakRaw>>,
+    dem: &Path,
+    meta: &DemMeta,
     block_cache: usize,
+    threads: usize,
 ) -> Result<Vec<Peak>> {
+    let filled = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("Error building thread pool")?
+        .install(|| {
+            peak_clusters
+                .into_par_iter()
+                .map(|cluster| {
+                    WORKER.with(|cell| {
+                        if cell.borrow().is_none() {
+                            *cell.borrow_mut() = Some(WorkerState {
+                                ds: Dataset::open(dem).expect("open DEM"),
+                                raster_size: (meta.width as isize, meta.height as isize),
+                                gt: meta.gt,
+                                block_size: (meta.block_w as isize, meta.block_h as isize),
+                                cache: BlockCache::<DataType>::new(block_cache),
+                                nodata: meta.nodata,
+                            });
+                        }
+
+                        let mut borrow = cell.borrow_mut();
+
+                        let state = borrow.as_mut().unwrap();
+
+                        let mut out = Vec::with_capacity(cluster.len());
+
+                        for p in cluster {
+                            if let Some(elev) = elevation_from_dem_state(state, p.point)?
+                                && elev > 0
+                            {
+                                out.push(Peak {
+                                    id: p.id,
+                                    point: p.point,
+                                    elev,
+                                });
+                            }
+                        }
+
+                        Ok(out)
+                    })
+                })
+                .collect::<Vec<Result<Vec<Peak>>>>()
+        });
+
+    let mut peaks = Vec::new();
+
+    for r in filled {
+        let mut v = r?;
+        peaks.append(&mut v);
+    }
+
+    Ok(peaks)
+}
+
+fn read_peaks(file: &Path) -> Result<Vec<PeakRaw>> {
     let file = File::open(file).context("Error opening input file")?;
 
-    let mut cache = BlockCache::<DataType>::new(block_cache);
+    let proj =
+        Proj::new_known_crs("EPSG:4326", "EPSG:3035", None).context("Error creating projection")?;
 
-    let nodata = band.no_data_value();
-
-    let mut peaks = BufReader::new(file)
+    BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .map(|line| line.trim().to_string())
@@ -402,17 +519,9 @@ fn read_peaks(
                 .convert(point)
                 .context("Error projecting coordinates")?;
 
-            let elev =
-                elevation_from_dem(band, gt, raster_size, block_size, &mut cache, nodata, point)?
-                    .unwrap_or(0);
-
-            Ok(Peak { id, point, elev })
+            Ok(PeakRaw { id, point })
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    peaks.retain(|p| p.elev > 0);
-
-    Ok(peaks)
+        .collect()
 }
 
 fn coord_to_pixel(gt: [f64; 6], point: Point) -> (f64, f64) {
@@ -422,27 +531,24 @@ fn coord_to_pixel(gt: [f64; 6], point: Point) -> (f64, f64) {
     (x, y)
 }
 
-fn elevation_from_dem(
-    band: &gdal::raster::RasterBand,
-    gt: [f64; 6],
-    raster_size: (isize, isize),
-    block_size: (isize, isize),
-    cache: &mut BlockCache<DataType>,
-    nodata: Option<f64>,
-    point: Point,
-) -> Result<Option<DataType>> {
-    let (px_f, py_f) = coord_to_pixel(gt, point);
+fn elevation_from_dem_state(state: &mut WorkerState, point: Point) -> Result<Option<DataType>> {
+    let (px_f, py_f) = coord_to_pixel(state.gt, point);
 
     let x = px_f.round() as isize;
     let y = py_f.round() as isize;
 
-    if x < 0 || y < 0 || x >= raster_size.0 || y >= raster_size.1 {
+    if x < 0 || y < 0 || x >= state.raster_size.0 || y >= state.raster_size.1 {
         return Ok(None);
     }
 
-    let z = read_band_data_cached(band, block_size, cache, x, y)?;
+    let band = state
+        .ds
+        .rasterband(1)
+        .context("Error fetching raster band 1")?;
 
-    if let Some(nd) = nodata
+    let z = read_band_data_cached(&band, state.block_size, &mut state.cache, x, y)?;
+
+    if let Some(nd) = state.nodata
         && (z as f64) == nd
     {
         return Ok(None);
